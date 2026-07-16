@@ -1,7 +1,9 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Security/Security.h>
 #import <dlfcn.h>
 #import <math.h>
+#import <string.h>
 
 @interface HoverButton : NSButton
 @property(nonatomic, weak) NSView *hoverOverlay;
@@ -540,11 +542,12 @@
     }
 
     NSString *command = [NSString stringWithFormat:
-        @"do shell script \"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
-         "/bin/rm -f /var/run/nologin; /sbin/shutdown -h +%ld '定时关机'\" "
-         "with administrator privileges",
+        @"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
+         "/bin/rm -f /var/run/nologin; "
+         "/usr/bin/nohup /sbin/shutdown -h +%ld '定时关机' "
+         "</dev/null >/dev/null 2>&1 &",
         (long)minutes];
-    if ([self runPrivilegedAppleScript:command]) {
+    if ([self runPrivilegedShellCommand:command]) {
         shutdownDate = [NSDate dateWithTimeIntervalSinceNow:minutes * 60.0];
         [self startShutdownCountdownUntil:shutdownDate];
         timeText = [formatter stringFromDate:shutdownDate];
@@ -560,9 +563,9 @@
         return;
     }
     NSString *command =
-        @"do shell script \"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
-         "/bin/rm -f /var/run/nologin\" with administrator privileges";
-    if ([self runPrivilegedAppleScript:command]) {
+        @"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
+         "/bin/rm -f /var/run/nologin";
+    if ([self runPrivilegedShellCommand:command]) {
         [self clearShutdownCountdown];
         NSAlert *success = [[NSAlert alloc] init];
         success.messageText = @"定时关机已取消";
@@ -622,21 +625,52 @@
     self.shutdownCountdownLabel.hidden = YES;
 }
 
-- (BOOL)runPrivilegedAppleScript:(NSString *)source {
-    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
-    NSDictionary *errorInfo = nil;
-    [script executeAndReturnError:&errorInfo];
-    if (errorInfo == nil) {
-        return YES;
+- (BOOL)runPrivilegedShellCommand:(NSString *)command {
+    AuthorizationRef authorization = NULL;
+    OSStatus status = AuthorizationCreate(
+        NULL,
+        kAuthorizationEmptyEnvironment,
+        kAuthorizationFlagDefaults,
+        &authorization);
+    if (status == errAuthorizationSuccess) {
+        const char *toolPath = "/bin/sh";
+        AuthorizationItem item = {
+            kAuthorizationRightExecute,
+            (UInt32)strlen(toolPath),
+            (void *)toolPath,
+            0
+        };
+        AuthorizationRights rights = {1, &item};
+        AuthorizationFlags flags =
+            kAuthorizationFlagInteractionAllowed |
+            kAuthorizationFlagPreAuthorize |
+            kAuthorizationFlagExtendRights;
+        status = AuthorizationCopyRights(authorization, &rights, NULL, flags, NULL);
+        if (status == errAuthorizationSuccess) {
+            const char *commandText = command.UTF8String;
+            char *arguments[] = {"-c", (char *)commandText, NULL};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            status = AuthorizationExecuteWithPrivileges(
+                authorization,
+                toolPath,
+                kAuthorizationFlagDefaults,
+                arguments,
+                NULL);
+#pragma clang diagnostic pop
+        }
+        AuthorizationFree(authorization, kAuthorizationFlagDefaults);
     }
 
-    NSNumber *errorNumber = errorInfo[NSAppleScriptErrorNumber];
-    if (errorNumber.integerValue == -128) {
+    if (status == errAuthorizationSuccess) {
+        return YES;
+    }
+    if (status == errAuthorizationCanceled) {
         return NO;
     }
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"定时操作未能执行";
-    alert.informativeText = errorInfo[NSAppleScriptErrorMessage] ?: @"请检查管理员权限后重试。";
+    alert.informativeText = [NSString stringWithFormat:@"系统授权失败（错误 %d）。", (int)status];
     alert.alertStyle = NSAlertStyleCritical;
     [alert runModal];
     return NO;
