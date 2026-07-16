@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
+#import <math.h>
 
 @interface HoverButton : NSButton
 @property(nonatomic, weak) NSView *hoverOverlay;
@@ -8,6 +9,7 @@
 @property(nonatomic, weak) NSView *hoverBorder;
 @property(nonatomic, weak) NSView *shineView;
 @property(nonatomic) CGFloat baseOverlayAlpha;
+@property(nonatomic) SEL rightClickAction;
 @property(nonatomic, strong) NSTrackingArea *hoverTrackingArea;
 @end
 
@@ -85,6 +87,14 @@
     });
 }
 
+- (void)rightMouseDown:(NSEvent *)event {
+    if (self.rightClickAction != NULL) {
+        [NSApp sendAction:self.rightClickAction to:self.target from:self];
+        return;
+    }
+    [super rightMouseDown:event];
+}
+
 @end
 
 @interface TrafficLightButton : NSButton
@@ -126,6 +136,9 @@
 @property(nonatomic, strong) NSView *restartGlass;
 @property(nonatomic, strong) NSView *shutdownGlass;
 @property(nonatomic, strong) NSImageView *headerIcon;
+@property(nonatomic, strong) NSTextField *shutdownCountdownLabel;
+@property(nonatomic, strong) NSTimer *shutdownCountdownTimer;
+@property(nonatomic, strong) NSDate *scheduledShutdownDate;
 @end
 
 
@@ -134,6 +147,7 @@
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self buildWindow];
+    [self restoreShutdownCountdown];
     [NSApp activateIgnoringOtherApps:YES];
 }
 
@@ -295,6 +309,7 @@
     NSTextField *label = [NSTextField labelWithString:title];
     label.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
     label.textColor = NSColor.labelColor;
+    NSTextField *countdownLabel = nil;
 
     if (primary) {
         icon.frame = NSMakeRect(22, 32, 28, 28);
@@ -302,6 +317,16 @@
     } else {
         icon.frame = NSMakeRect(20, size.height - 48, 28, 28);
         label.frame = NSMakeRect(20, 16, size.width - 40, 25);
+        if ([title isEqualToString:@"关机"]) {
+            label.frame = NSMakeRect(20, 16, 62, 25);
+            countdownLabel = [NSTextField labelWithString:@""];
+            countdownLabel.frame = NSMakeRect(82, 17, size.width - 102, 22);
+            countdownLabel.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium];
+            countdownLabel.textColor = NSColor.secondaryLabelColor;
+            countdownLabel.alignment = NSTextAlignmentRight;
+            countdownLabel.hidden = YES;
+            self.shutdownCountdownLabel = countdownLabel;
+        }
     }
     NSView *hoverOverlay = [[NSView alloc] initWithFrame:content.bounds];
     hoverOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -360,6 +385,9 @@
 
     [content addSubview:icon];
     [content addSubview:label];
+    if (countdownLabel != nil) {
+        [content addSubview:countdownLabel];
+    }
 
     HoverButton *hitArea = [[HoverButton alloc] initWithFrame:content.bounds];
     hitArea.title = @"";
@@ -372,6 +400,10 @@
     hitArea.action = action;
     hitArea.toolTip = title;
     hitArea.accessibilityLabel = title;
+    if ([title isEqualToString:@"关机"]) {
+        hitArea.rightClickAction = @selector(showShutdownTimerMenu:);
+        hitArea.toolTip = @"左键关机 · 右键定时";
+    }
     hitArea.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:hitArea];
 
@@ -426,6 +458,188 @@
     if ([self confirm:@"确定要关机吗？" detail:@"未保存的内容可能会丢失。" button:@"关机"]) {
         [self runAppleScript:@"tell application \"System Events\" to shut down"];
     }
+}
+
+- (void)showShutdownTimerMenu:(id)sender {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"定时关机"];
+    NSArray<NSDictionary *> *options = @[
+        @{@"title": @"15 分钟后", @"minutes": @15},
+        @{@"title": @"30 分钟后", @"minutes": @30},
+        @{@"title": @"1 小时后", @"minutes": @60},
+        @{@"title": @"2 小时后", @"minutes": @120}
+    ];
+    for (NSDictionary *option in options) {
+        NSMenuItem *item = [[NSMenuItem alloc]
+            initWithTitle:option[@"title"]
+            action:@selector(scheduleShutdown:)
+            keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = option[@"minutes"];
+        [menu addItem:item];
+    }
+    [menu addItem:NSMenuItem.separatorItem];
+
+    NSMenuItem *custom = [[NSMenuItem alloc]
+        initWithTitle:@"自定义时间…"
+        action:@selector(scheduleCustomShutdown:)
+        keyEquivalent:@""];
+    custom.target = self;
+    [menu addItem:custom];
+
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *cancel = [[NSMenuItem alloc]
+        initWithTitle:@"取消定时关机"
+        action:@selector(cancelScheduledShutdown:)
+        keyEquivalent:@""];
+    cancel.target = self;
+    [menu addItem:cancel];
+
+    [NSMenu popUpContextMenu:menu withEvent:NSApp.currentEvent forView:sender];
+}
+
+- (void)scheduleShutdown:(NSMenuItem *)sender {
+    [self scheduleShutdownAfterMinutes:[sender.representedObject integerValue]];
+}
+
+- (void)scheduleCustomShutdown:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"自定义定时关机";
+    alert.informativeText = @"输入多少分钟后关机（1–1440）。";
+    [alert addButtonWithTitle:@"继续"];
+    [alert addButtonWithTitle:@"取消"];
+
+    NSTextField *minutesField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 220, 28)];
+    minutesField.placeholderString = @"例如：45";
+    minutesField.stringValue = @"45";
+    alert.accessoryView = minutesField;
+    [alert.window setInitialFirstResponder:minutesField];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+    NSInteger minutes = minutesField.integerValue;
+    if (minutes < 1 || minutes > 1440) {
+        NSAlert *error = [[NSAlert alloc] init];
+        error.messageText = @"时间无效";
+        error.informativeText = @"请输入 1 到 1440 之间的分钟数。";
+        error.alertStyle = NSAlertStyleWarning;
+        [error runModal];
+        return;
+    }
+    [self scheduleShutdownAfterMinutes:minutes];
+}
+
+- (void)scheduleShutdownAfterMinutes:(NSInteger)minutes {
+    NSDate *shutdownDate = [NSDate dateWithTimeIntervalSinceNow:minutes * 60.0];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"HH:mm";
+    NSString *timeText = [formatter stringFromDate:shutdownDate];
+    NSString *detail = [NSString stringWithFormat:@"这台 Mac 将在 %@（约 %ld 分钟后）关机。", timeText, (long)minutes];
+    if (![self confirm:@"设置定时关机？" detail:detail button:@"设置"]) {
+        return;
+    }
+
+    NSString *command = [NSString stringWithFormat:
+        @"do shell script \"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
+         "/bin/rm -f /var/run/nologin; /sbin/shutdown -h +%ld '定时关机'\" "
+         "with administrator privileges",
+        (long)minutes];
+    if ([self runPrivilegedAppleScript:command]) {
+        shutdownDate = [NSDate dateWithTimeIntervalSinceNow:minutes * 60.0];
+        [self startShutdownCountdownUntil:shutdownDate];
+        timeText = [formatter stringFromDate:shutdownDate];
+        NSAlert *success = [[NSAlert alloc] init];
+        success.messageText = @"定时关机已设置";
+        success.informativeText = [NSString stringWithFormat:@"预计关机时间：%@", timeText];
+        [success runModal];
+    }
+}
+
+- (void)cancelScheduledShutdown:(id)sender {
+    if (![self confirm:@"取消定时关机？" detail:@"已安排的系统关机任务将被取消。" button:@"取消定时"]) {
+        return;
+    }
+    NSString *command =
+        @"do shell script \"/usr/bin/pkill -TERM -x shutdown 2>/dev/null || true; "
+         "/bin/rm -f /var/run/nologin\" with administrator privileges";
+    if ([self runPrivilegedAppleScript:command]) {
+        [self clearShutdownCountdown];
+        NSAlert *success = [[NSAlert alloc] init];
+        success.messageText = @"定时关机已取消";
+        [success runModal];
+    }
+}
+
+- (void)restoreShutdownCountdown {
+    NSDate *savedDate = [NSUserDefaults.standardUserDefaults objectForKey:@"ScheduledShutdownDate"];
+    if ([savedDate isKindOfClass:NSDate.class] && [savedDate timeIntervalSinceNow] > 0) {
+        [self startShutdownCountdownUntil:savedDate];
+    } else {
+        [self clearShutdownCountdown];
+    }
+}
+
+- (void)startShutdownCountdownUntil:(NSDate *)date {
+    self.scheduledShutdownDate = date;
+    [NSUserDefaults.standardUserDefaults setObject:date forKey:@"ScheduledShutdownDate"];
+    [self.shutdownCountdownTimer invalidate];
+    self.shutdownCountdownTimer = [NSTimer
+        scheduledTimerWithTimeInterval:1.0
+        target:self
+        selector:@selector(updateShutdownCountdown:)
+        userInfo:nil
+        repeats:YES];
+    [self updateShutdownCountdown:nil];
+}
+
+- (void)updateShutdownCountdown:(NSTimer *)timer {
+    NSTimeInterval remaining = [self.scheduledShutdownDate timeIntervalSinceNow];
+    if (remaining <= 0) {
+        [self clearShutdownCountdown];
+        return;
+    }
+
+    NSInteger totalSeconds = (NSInteger)ceil(remaining);
+    NSInteger hours = totalSeconds / 3600;
+    NSInteger minutes = (totalSeconds % 3600) / 60;
+    NSInteger seconds = totalSeconds % 60;
+    if (hours > 0) {
+        self.shutdownCountdownLabel.stringValue =
+            [NSString stringWithFormat:@"剩余 %ld:%02ld:%02ld", (long)hours, (long)minutes, (long)seconds];
+    } else {
+        self.shutdownCountdownLabel.stringValue =
+            [NSString stringWithFormat:@"剩余 %ld:%02ld", (long)minutes, (long)seconds];
+    }
+    self.shutdownCountdownLabel.hidden = NO;
+}
+
+- (void)clearShutdownCountdown {
+    [self.shutdownCountdownTimer invalidate];
+    self.shutdownCountdownTimer = nil;
+    self.scheduledShutdownDate = nil;
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"ScheduledShutdownDate"];
+    self.shutdownCountdownLabel.stringValue = @"";
+    self.shutdownCountdownLabel.hidden = YES;
+}
+
+- (BOOL)runPrivilegedAppleScript:(NSString *)source {
+    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+    NSDictionary *errorInfo = nil;
+    [script executeAndReturnError:&errorInfo];
+    if (errorInfo == nil) {
+        return YES;
+    }
+
+    NSNumber *errorNumber = errorInfo[NSAppleScriptErrorNumber];
+    if (errorNumber.integerValue == -128) {
+        return NO;
+    }
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"定时操作未能执行";
+    alert.informativeText = errorInfo[NSAppleScriptErrorMessage] ?: @"请检查管理员权限后重试。";
+    alert.alertStyle = NSAlertStyleCritical;
+    [alert runModal];
+    return NO;
 }
 
 - (BOOL)confirm:(NSString *)title detail:(NSString *)detail button:(NSString *)button {
